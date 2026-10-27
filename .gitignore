@@ -1,0 +1,51 @@
+# Experiment products
+outputs/
+runs/
+review/
+control/
+smoke/
+*_smoke/
+wandb/
+*.log
+
+# Checkpoints and tensors
+checkpoints/
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.bin
+*.npz
+*.npy
+
+# Data snapshots and feature caches
+data/
+data_snapshots/
+cache/
+caches/
+vae_cache/
+*.tfrecord
+*.tfrecord-*
+*.h5
+*.hdf5
+*.zarr/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.ipynb_checkpoints/
+
+# Credentials and local config
+.env
+.env.*
+*.pem
+*.key
+
+# OS
+.DS_Store
+
+# .gitignore cannot match by size. Files over 50MB must not be committed;
+# check before committing, e.g. `find . -size +50M -not -path './.git/*'`.

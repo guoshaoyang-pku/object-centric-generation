@@ -1,0 +1,156 @@
+# object-centric-generation
+
+研究原型：把未来视频压缩成一组带连续轨迹的“父候选”token，在这个 token 集合上做条件 flow matching。要检验的问题是：**在同样的数据与算力下，生成这种对象结构的 latent，是否比生成像素或规则网格 latent 更容易得到持续、少碎裂、交互合理的未来。**
+
+当前状态：单个训练 seed、单个数据集上的早期结果。下文的数字都来自 [`docs/current-setting-2026-10-27.md`](docs/current-setting-2026-10-27.md) 和 2026-10-27 的实验记录，没有经过独立复现。
+
+## Task
+
+| 项 | 取值 |
+|---|---|
+| 数据 | MOVi-E，9,749 段训练，250 段验证；128×128，每段 24 帧，带纹理与相机运动 |
+| 条件 | 前 4 帧 |
+| 目标 | 后 20 帧，**一次联合生成**，不是逐帧自回归 |
+| 空间 | 二维画面加视频时间 $(x,y,t)$。不是三维重建 |
+| 评测集合 | showcase4（固定 4 段展示）与 pilot32（固定 32 段验证），采样 seed 17 和 29 全部保留 |
+
+“一次联合生成”指生成器输出的一组 token 定义整段未来。第 15 帧画坏，不能归因于逐帧误差累积。
+
+## Method
+
+整体是 latent 生成模型：先训一个自编码器（codec），再在它的 latent 空间里学条件分布。与常见做法的区别在于 latent 的形状和解码方式。
+
+### Object latent
+
+- **Latent**：每段未来是 $z\in\mathbb R^{250\times128}$，即 250 个“父候选”（parent）token，每个 128 维。
+- **编码器**（约 1.0M 参数）：冻结的 Wan2.2 VAE 把未来帧编码成特征 token（离线缓存）；250 个可学习 query 做一次带高斯空间偏置的 cross-attention，第 $k$ 个 query 偏向读取靠近固定 anchor $a_k$ 的特征。
+- **解码器**：一个共享 MLP（128→256→256→806）把每个 token 独立解码成一个 parent：
+  - 中心沿一条**三次 Bézier 轨迹** $c(t)$ 移动，形状由随 $t$ 线性变化的仿射 $A(t)$ 决定；
+  - 4 个局部椭圆 **Gaussian 子核**、一个基础颜色、109 个局部 RBF 纹理；
+  - 子核与纹理都定义在 parent 的移动局部坐标 $\ell=A(t)^{-1}((x,y)-c(t))$ 里，整个 parent 共享一条运动。
+- **渲染器**：对任意查询点 $(x,y,t)$，按各 parent 的密度做 softmax 归一化混色。
+
+这个渲染方式有几条容易被误读的性质：
+
+1. 背景也由 parent 表示。每个像素都被某些 parent 染色，250 个 parent 同时铺满物体、地面和墙。
+2. **没有深度顺序，也没有 alpha 遮挡**。下标不是图层；重叠时按密度比例混色。
+3. parent 覆盖整个时间区间，没有出生或消失开关。
+4. anchor 取自固定 xy 网格，flow 还有可学习的 slot embedding。所以第 $k$ 个 token 的含义更接近“起始在 anchor $k$ 附近、可变形可移动的一块区域”，**不是语义对象**。250 个 parent × 4 个子核不等于 250 个对象。
+
+### Generator
+
+- **Flow matching**：$z_s=(1-s)\epsilon+s z_0$，回归速度 $z_0-\epsilon$；$z_0$ 是编码器的后验采样，并且 `detach`。
+- **网络**：8 层，宽 384，6 头；每层是 250 个 token 的全局 self-attention，加上对前缀 token 的 cross-attention。23,070,848 个参数，随机初始化。
+- **采样**：从噪声出发做 16 步 Euler 积分得到 $\hat z_0$，再解码渲染。同一个 $\hat z_0$ 被查询 20 次得到 20 帧。去噪步 $s$ 与视频时间 $t$ 是两回事。
+- **泄漏边界**：采样只调用前缀条件与 flow，从不调用编码器。真实未来只在训练时用于构造 $z_0$ 和 RGB 标签。
+
+### Training stages
+
+| 阶段 | 训练什么 | 状态 |
+|---|---|---|
+| 1. 对象 AE | codec（编码器 + 解码器），RGB MSE + $10^{-5}$ KL | 完成，100k 更新，0.747 H200 h |
+| 2. 冻结 codec 的 flow | 小对象 flow，仅 flow matching 损失 | 完成，27,362 更新，0.25 H200 h |
+| 3. 第一轮扩大训练 | 冻结对照、两个联合训练臂、一个 2 卡 DDP 集中 run | 四个 run 全部发散（见下） |
+| 4. 稳定版集中 run | QK 归一化 flow，冻结 codec | 2026-10-27 23:09 启动，进行中 |
+
+## Current Results
+
+### 1. 小预算基线（每个生成器 0.25 H200 h）
+
+冻结 codec、pilot32、16 步、native128、两个 seed 平均：
+
+| 方法 | RGB MSE↓ | 前景 MSE↓ | 运动差分 cosine↑ |
+|---|---:|---:|---:|
+| 重复最后一帧 | 0.021402 | 0.036928 | — |
+| 全局相似变换外推（零训练） | 0.017764 | 0.032219 | **0.08699** |
+| 小对象 flow | **0.013932** | **0.030256** | 0.03765 |
+| 小 VAE-patch flow | 0.018060 | 0.037803 | 0.02094 |
+| Wan 对象适配 | 0.029204 | 0.057491 | 0.00097 |
+
+对象 flow 的 MSE 最低，但运动 cosine 低于零训练的全局外推。
+
+### 2. 第一轮扩大训练：最好点与 AE 下限
+
+本轮最好的 pilot32 sample-16 MSE 是 **0.01089**（联合训练臂，累计 4 h，在该 run 发散之前）。AE 下限约为 **0.0033**：1 h 里程碑上各臂的 future-AE 为 0.00326–0.00343。future-AE 让编码器看到真实未来，只是重建上界，不是生成结果。生成误差仍是 AE 下限的 3 倍以上，当前瓶颈在 flow，不在 codec 的重建上限。
+
+1 h 里程碑上（pilot32，直接 64px 查询，16 步，两个 seed），冻结 codec 的生成好于两个联合臂：sample-16 MSE 0.0113 对 0.0123–0.0126，运动 cosine 约 0.087 对 0.064–0.072。4 h 时联合臂（0.0109–0.0111）低于冻结臂，但这时冻结臂已经发散，这一对比无效。
+
+### 3. 第一轮的四个 run 全部发散
+
+| run | 发散起点（约） | 发散前最好的 pilot32 sample-16 |
+|---|---|---|
+| 冻结对照（batch 8） | step 190k，2.5 h | 0.01135（1 h） |
+| 冻结 DDP 集中 run（global batch 64） | step 115k，2.4 GPU h | 无 pilot32 里程碑 |
+| 联合，带 $L_\text{match}$ | step 220k，约 4.9 h | **0.01089**（4 h） |
+| 联合，无 $L_\text{match}$ | step 208k 起出现尖峰 | 0.01111（4 h） |
+
+现象：pre-clip 梯度范数指数增长，flow loss 停在约 1.62，相当于输出与输入无关的常数预测；之后 sample MSE 约 0.042，运动 cosine 为 0。
+
+在发散前的健康 checkpoint 上，时间嵌入 MLP 第一层的权重范数从 10.6 稳定涨到 19.6，第 0 层 self-attention 的 QKV 投影开始抬头（24 → 26 → 38），随后 attention logit 失控。学习率恒为 $10^{-4}$，没有衰减，也没有 QK 归一化。
+
+### 4. 稳定版 run（进行中，尚无结果）
+
+`src/stable_flow.py` 对 self 和 cross attention 都做逐头 QK RMS 归一化；`src/stable_flow_ddp.py` 加了 2000 步 warmup 加 cosine 衰减（$10^{-4}\to10^{-5}$）、完整保存的 EMA、发散看门狗和不轮转的定期 checkpoint。集中 run 从冻结对照的 1 h checkpoint 热启动，2 卡，目标累计 60 训练 GPU 时。目前没有可以报告的评测结果。
+
+### 5. Object-centric 诊断：parent 是可变形网格，不是绑定的对象
+
+`src/object_views.py` 把每个未来像素归给混色权重最大的 parent，再与 MOVi 官方实例分割对比，并以固定的最近 anchor 划分作参照。在 pilot32 的 61 个动态实例上：
+
+- 动态物体的首帧 parent 重叠：AE 0.18–0.19，采样 0.14–0.15，固定网格参照 0.14。
+- 到末帧只剩 0.02–0.04。
+- 静态物体与背景的重叠是 0.48–0.55，低于固定网格参照（0.67–0.89）。
+
+动态物体在 parent 之间交接，并不由同一组 token 持续承载。另一项统计：一个有明显移动的真实实例，平均对应约 23.5 个有效 parent。
+
+### 6. 编码器是已知瓶颈
+
+固定解码器，用真实未来直接优化 $z$，4 段展示的 native128 MSE 从 0.003313 降到 0.000970（−70.7%）。解码器能表达得更好，是编码器没有找到对应的 latent。
+
+## What We Cannot Claim
+
+- **物理遵循或物理优势**。共同 64px 口径下，对静止续写做 σ=2 的空间低通，前景 MSE 为 0.025753，略低于对象 flow 的 0.026455，配对差异区间跨零。MSE 优势有一部分来自模糊。
+- **更好的运动**。运动 cosine 低于零训练的全局相似变换外推。
+- **语义对象或身份绑定**。见上面的诊断。
+- **按图层的 alpha 合成或遮挡建模**。渲染器是密度归一化混色。
+- **泛化**。只有一个训练 seed；showcase4 与 pilot32 都是被反复看过的开发验证集。
+- 增加 Euler 步数（16→64→128）没有修复固定展示案例。
+
+所以现阶段的结果只能检验“可变形持续网格 + 全局交互”这一弱化版本，还没有检验完整的“对象”假设。
+
+## Repository Layout
+
+```
+README.md               本文
+CONTRIBUTING.md         协作规则：泄漏边界、报告口径、seed 与选例
+docs/
+  current-setting-2026-10-27.md   完整 setting、原理与证据
+  ROADMAP.md                      下一轮计划与未决问题
+src/
+  README.md             每个文件的作用
+  *.py                  2026-10-27 的训练、稳定化与诊断代码
+  code_base_v4/         被导入的 codec、渲染器、小 flow 与评测模块（不可变快照的副本）
+history/                2026-10-27 当夜六版源码快照（v1–v6），按时间顺序逐个提交；见 history/README.md
+```
+
+## Getting Started
+
+代码可以在 CPU 上做单元测试：
+
+```bash
+cd src && python test_stable_flow.py
+```
+
+```bash
+cd src/code_base_v4 && python -m unittest test_small_object_flow
+```
+
+训练与评测需要本仓库**不包含**的输入：MOVi-E 数据快照、冻结 Wan2.2 VAE 的特征缓存、C2 codec checkpoint 及其 SHA256、cohort 划分文件、作为起点的 flow checkpoint。各脚本的入参见 `src/README.md`。
+
+## Docs
+
+- [`docs/current-setting-2026-10-27.md`](docs/current-setting-2026-10-27.md)：当前实现、原理、三个结构性风险与评测口径。
+- [`docs/ROADMAP.md`](docs/ROADMAP.md)：分辨率消融、长视频，以及尚未回答的问题。
+
+## License
+
+[MIT](LICENSE)。
