@@ -1,0 +1,21 @@
+# Regular spacetime VAE-patch baseline
+
+This independent v5 experiment compares a regular VAE-grid target with the object target. It is **not raw RGB diffusion**. No v4 runtime source was changed.
+
+The prefix is fixed to v3 C2 baseline `initial.pt`, SHA `9a4c2b7afaa4fc9e41d298ef680d0f4dd5b181bdf61068090c3a10a5cd536d26`. This is the explicitly imported trained C2 checkpoint at the start of the encoder experiment, not random weights. Only its frozen prefix `adapt_features()` is used. The future object posterior and object renderer are never used by this baseline.
+
+Cached future features `[384,48]` have grid `[6,8,8,48]`. Exact 2x2 spatial packing produces `[96,192]` tokens in `(t,patch_y,patch_x,dy,dx,channel)` order. Inverse packing restores every cached value. The target contains 18,432 values; the object target contains 32,000. This is a practical training-cost comparison, not a matched bitrate or compression-capacity comparison.
+
+The backbone is the same `ObjectFlow` family: width384, depth8, heads6, full self-attention and prefix cross-attention, learned slot IDs and zero output initialization. It has **23,060,928** trainable parameters, versus 23,070,848 in the 250x128 object model. The target is the cached VAE posterior mode; the object path samples its learned posterior. That target-distribution difference remains explicit. The pretrained VAE decoder also supplies a different visual prior and decoding cost from the learned object renderer.
+
+Training uses pure velocity flow matching. VAE decoding is absent from the training graph. Clip sampling, LR, batch8 and seeds match the object pilot. A common `[250,128]` Gaussian draw is generated each update; its first18,432 entries become the patch noise. The subsequent uniform time draw therefore uses exactly the same random-stream position as the object run. Evaluation likewise uses a shared target-ID/seed object-noise draw before selecting the patch prefix. This preserves the standard independent Gaussian noise law.
+
+Evaluation restores the cached normalization with FP32 `z*std+mean`, invokes the frozen original Wan VAE, and takes decoded frames0:20 from the native21-frame result. The actual-GPU probe compares all128px RGB pixels against an independent literal implementation of `evaluate_vae_floor.py`, before permitting a quality run. CPU mock-VAE parity only validates execution and is never reported as actual Wan parity.
+
+Fixed sampling settings are4/16 steps with seeds17/29, every seed saved. Wrong-prefix controls use16 steps with both seeds and identical target-ID noise. The wrong mapping is the registered pilot32 sorted cyclic shift1; the disjoint showcase4 has its own sorted cyclic shift1. Future RGB and segmentation masks enter metrics only after all generation. The future-seen VAE reference is labelled separately. The GIF shows GT, persistence, future-seen VAE, four normal samples and two wrong-prefix samples.
+
+Foreground/background MSE uses positive official instance masks with RGB-source and mask SHA verification. Motion metrics are representation independent. No parent weights or object-identity quantities are invented for this patch baseline. These metrics do not prove physical compliance. The merged annotation root contains the original8 plus pilot32 records and is bound in the experiment identity.
+
+The prepared training config uses900 accumulated training-loop seconds, a1800-second hard wall cap, absolute08:45 deadline, eval1000/save250 and keep12. The final budget endpoint is the comparison result; an earlier wall/deadline stop is explicitly partial. Evaluation cost is reported separately. The GPU probe is bounded to240 seconds and verifies actual VAE reference pixels, batch8 forward/backward for three updates, every sampling setting, frozen prefix/VAE state, and peak memory. Root performs GPU admission and launch; preparing these files launches nothing.
+
+CPU evidence in `code_v5_smoke/admission_checks/` covers six unit tests, exact pack/inverse and shared noise, mock reference pixels, absence of future-encoder/decoder calls in training, full CLI2+resume1 versus continuous3 bitwise states, cumulative budget stopping, and all normal/wrong-prefix evaluation paths. Production Wan VAE parity remains pending until the GPU probe reports `status: passed` and `vae_reference_parity.pixelwise_equal: true`.
