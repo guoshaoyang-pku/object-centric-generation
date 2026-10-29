@@ -110,9 +110,48 @@ CV 是研究积累很深的领域。成熟的子问题已经被反复优化，�
 
 在发散前的健康 checkpoint 上，时间嵌入 MLP 第一层的权重范数从 10.6 稳定涨到 19.6，第 0 层 self-attention 的 QKV 投影开始抬头（24 → 26 → 38），随后 attention logit 失控。学习率恒为 $10^{-4}$，没有衰减，也没有 QK 归一化。
 
-### 4. 稳定版 run（进行中，尚无结果）
+### 4. 稳定版 run：10 GPU 时以后只是在记训练集
 
-`src/stable_flow.py` 对 self 和 cross attention 都做逐头 QK RMS 归一化；`src/stable_flow_ddp.py` 加了 2000 步 warmup 加 cosine 衰减（$10^{-4}\to10^{-5}$）、完整保存的 EMA、发散看门狗和不轮转的定期 checkpoint。集中 run 从冻结对照的 1 h checkpoint 热启动，2 卡，目标累计 60 训练 GPU 时。目前没有可以报告的评测结果。
+`src/stable_flow.py` 对 self 和 cross attention 都做逐头 QK RMS 归一化；`src/stable_flow_ddp.py` 加了 2000 步 warmup 加 cosine 衰减（$10^{-4}\to10^{-5}$）、完整保存的 EMA、发散看门狗和不轮转的定期 checkpoint。集中 run 从冻结对照的 1 h checkpoint 热启动，2 卡，没有再发散。
+
+`src/memory_eval.py` 用训练器自己的评测函数，给同一个 checkpoint 在训练集 32 段与两组 heldout 上打分（EMA，sample-16 MSE，seed 17/29 平均）：
+
+| 训练 GPU 时 | 训练集 32 | pilot32 | confirmation64 |
+|---|---|---|---|
+| 4 h | 0.0101 | — | 0.0117 |
+| 10 h | 0.0065 | **0.01022** | **0.01102** |
+| 20 h | 0.0053 | 0.01025 | 0.0112 |
+
+10 h 时约 1,284 epoch。之后训练集一路下降，heldout 不动，confirmation64 略回升。主 run 在 21.6 GPU 时停下。`src/anneal_branch.py` 从 10 h 把学习率退火到 $10^{-5}$，heldout 反而略差（pilot32 0.01041，confirmation64 0.01117），只加深了记忆。
+
+### 4b. 镜像加倍数据：记忆减轻，heldout 不变
+
+`src/cache_mirrored_features.py` 把 9,749 段训练集水平镜像后重新经 VAE 编码，`src/stable_flow_mirror_ddp.py` 在原配方上用加倍的训练集，同起点、同 seed。10 h 时训练集 0.0086（主 run 0.0065），confirmation64 0.01102（相同），pilot32 0.01041（0.01022）。重复 epoch 不是 heldout 平台的主因。镜像不是新场景，这只是“更多数据”的下界证据。
+
+### 4c. GT 物体 token 的上限探针（oracle）
+
+问题：如果每个 token 就是一个像素精确、随时间跟踪的物体，前缀条件生成会不会更好？
+
+- `src/fetch_movi_segmentations.py` 取官方实例分割，核对记录 SHA，RGB 与快照逐像素相等。
+- `src/oracle.py` 共 250 个 parent：25 个 GT 实例槽，加 15×15 背景网格 parent。编码器只看自己掩码内的像素，不用 VAE；解码器是同族 TrajectoryDecoder，从头训练。
+- flow 只看 4 帧前缀和它们的掩码，单元测试核过不泄漏未来。
+- 训练用 `src/oracle_train.py`（codec 与 flow 两阶段），评测用 `src/oracle_eval.py`（cohort、object views、84 帧续写）。
+
+| 10 GPU 时 EMA | AE 下限 pilot32 | pilot32 s16 | confirmation64 s16 | 训练集 32 |
+|---|---|---|---|---|
+| 稳定版（C2 codec） | 0.00343 | 0.01022 | 0.01102 | 0.0065 |
+| oracle | 0.00328 | **0.00949** | **0.01084** | 0.0066 |
+
+- 按启动前写下的规则通过：两个 heldout 都更低，差距大于两个采样 seed 之差，运动 cos 也更高（0.152 对 0.130）。
+- 幅度小：减去各自 AE 下限后，confirmation64 几乎持平（0.00719 对 0.00727）。
+- 84 帧自回归续写（`src/long_rollout.py` 的同一协议）：第 3 段颜色漂移 0.021 对 0.042，物体身份明显更稳，但运动仍然衰减。
+- 只是上限探针：用了 GT 掩码，不说明无监督发现物体可行。
+
+### 4d. 进行中（2026-10-29 起）：模型规模与新场景数据
+
+- **181M flow**：768 宽、16 层，是 23M 的 7.9 倍。`src/make_scratch_branch.py` 写出未训练的起点，从头训练，只用 MOVi-E。
+- **新场景数据**：`src/fetch_movi_extra_features.py` 流式读取官方 MOVi-C/D/F 的 train split，只留 VAE 特征。`src/stable_flow_more_data_ddp.py` 在 34,973 段（约 3.6 倍）上训练 23M 与 181M 两个规模。评测仍只用 MOVi-E validation。
+- 结果出来后更新本节。
 
 ### 5. Object-centric 诊断：parent 是可变形网格，不是绑定的对象
 
@@ -149,7 +188,7 @@ docs/
   ROADMAP.md                      下一轮计划与未决问题
 src/
   README.md             每个文件的作用
-  *.py                  2026-10-27 的训练、稳定化与诊断代码
+  *.py                  训练、稳定化、诊断、oracle 与数据扩充代码（2026-10-27 起）
   code_base_v4/         被导入的 codec、渲染器、小 flow 与评测模块（不可变快照的副本）
 history/                2026-10-27 当夜六版源码快照（v1–v6），按时间顺序逐个提交；见 history/README.md
 ```

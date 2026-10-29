@@ -2,7 +2,7 @@
 
 两层代码：
 
-- `src/*.py`：2026-10-27 第一轮扩大训练与稳定化的代码，从原项目的 `research/20261027_claude/` 原样复制。
+- `src/*.py`：2026-10-27 起的训练、稳定化、诊断、oracle 与数据扩充代码，从原项目的 `research/20261027_claude/` 原样复制。集群控制脚本（supervisor、配额处理）不在这里。
 - `src/code_base_v4/`：上面这些脚本导入的 codec、渲染器、小 flow 和评测模块，从不可变快照 `research/20261027/snapshots/code_v4/` 原样复制。副本与快照 `checksums.json` 中的 SHA256 逐个一致。
 
 脚本默认在自己旁边找 `code_base_v4/`，也可以用环境变量 `PCV_CODE_BASE` 指向别处。`SHA256SUMS` 记录了本目录全部 `.py` 在复制时的哈希。
@@ -17,6 +17,18 @@
 | `stable_flow_ddp.py` | 稳定版集中训练：`StableObjectFlow`、warmup + cosine 学习率、完整 EMA、发散看门狗、定期 pin checkpoint。 |
 | `object_views.py` | 只读诊断：把每个未来像素归给混色权重最大的 parent，与 MOVi 实例分割对比，以最近 anchor 划分为参照；输出指标、GIF 和轨迹图。 |
 | `test_stable_flow.py` | `stable_flow.py` 的 CPU 测试：热启动、校准那一遍与旧模型一致、logit 有界。 |
+| `memory_eval.py` | 只读：用训练器自己的 `evaluate()` 给同一 checkpoint 在训练集（`pilot_train1024` 前 32 段）、pilot32、confirmation64 上打分，区分记忆与 heldout 生成。 |
+| `anneal_branch.py` | 从稳定版 run 的某个 checkpoint 分支出学习率退火 run，继承 flow、EMA、优化器和数据流。 |
+| `long_rollout.py` | 只读：84 帧自回归续写。第 0 段用真实前缀，之后把生成的最后 4 帧经冻结 VAE 重编码为条件。只有第 0 段有真值。 |
+| `cache_mirrored_features.py` | 把训练集水平镜像后，用同一个冻结 VAE 和编码函数生成特征缓存。 |
+| `stable_flow_mirror_ddp.py` | 包装 `stable_flow_ddp.py`（不改动），训练集加上镜像副本；评测只用原始 validation。 |
+| `fetch_movi_segmentations.py` | 按 byte range 读取官方 MOVi-E 记录，核对 SHA 与 RGB 逐像素相等，只保留实例分割与少量实例字段。 |
+| `oracle.py` | oracle codec：25 个 GT 实例槽加 225 个背景 parent，按掩码取像素的编码器，TrajectoryDecoder，存在性 logit；`OracleObjectFlow` 加每槽前缀 token。 |
+| `oracle_train.py` | oracle 的 DDP 训练，`--stage codec` 与 `--stage flow`，控制文件与预算规则同上。 |
+| `oracle_eval.py` | oracle 评测：`cohort`、`views`（物体所有权与轨迹）、`rollout`（用渲染帧与渲染所有权续写）。 |
+| `fetch_movi_extra_features.py` | 流式读取官方 MOVi-C/D/F 的 train shard，只保存冻结 VAE 特征，不落盘 RGB；不读 test 或 validation。 |
+| `make_scratch_branch.py` | 写出任意宽度/深度的未训练 step-0 起点，让 `stable_flow_ddp.py` 从头训练新规模。 |
+| `stable_flow_more_data_ddp.py` | 包装 `stable_flow_ddp.py`（不改动），训练集加上 MOVi-C/D/F 特征，可选再加镜像；评测只用 MOVi-E validation。 |
 
 ## 被导入的模块（src/code_base_v4/）
 
